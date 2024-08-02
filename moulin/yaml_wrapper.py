@@ -4,7 +4,7 @@
 Wrappers for yaml.Node that provide better API
 """
 
-from typing import Optional, List, Tuple, Iterator, Union
+from typing import Optional, List, Tuple, Iterator, Union, Dict
 
 from yaml.nodes import MappingNode, ScalarNode, SequenceNode, Node
 from yaml.constructor import SafeConstructor
@@ -18,10 +18,10 @@ yaml_constructor = SafeConstructor()
 class _YamlDefaultValue:
     """
     Helper class that have the same API as YamlValue, but is
-    constructed from a primitive type. It is used to provide default
+    constructed from a builtin type. It is used to provide default
     value in YamlValue.get() method
     """
-    def __init__(self, val: Union[bool, str, int, float, None]):
+    def __init__(self, val: Union[bool, str, int, float, List, Dict, None]):
         self._val = val
 
     def __bool__(self):
@@ -45,15 +45,82 @@ class _YamlDefaultValue:
     def as_int(self) -> int:
         "Get the integer value"
         if not isinstance(self._val, int):
-            raise TypeError("Expected int value")
+            raise TypeError("Expected integer value")
         return self._val
 
     @property
     def as_float(self) -> float:
         "Get the floating point value"
-        if not isinstance(self._val, int):
-            raise TypeError("Expected float value")
+        if not isinstance(self._val, float):
+            raise TypeError("Expected floating point value")
         return self._val
+
+    @property
+    def is_list(self) -> bool:
+        """Check if this node represents a list"""
+        return isinstance(self._val, list)
+
+    def __iter__(self) -> Iterator["_YamlDefaultValue"]:
+        if not isinstance(self._val, list):
+            raise TypeError("Expected list value")
+        for item in self._val:
+            # We need to wrap the value in _YamlDefaultValue to provide the same API
+            yield _YamlDefaultValue(item)
+
+    def __len__(self) -> int:
+        if not isinstance(self._val, list):
+            raise TypeError("Expected list value")
+        return len(self._val)
+
+    def __getitem__(self, idx: Union[int, str]) -> "_YamlDefaultValue":
+        if isinstance(idx, int):
+            if not isinstance(self._val, list):
+                raise TypeError("Expected list value")
+            # We need to wrap the value in _YamlDefaultValue to provide the same API
+            return _YamlDefaultValue(self._val[idx])
+        elif isinstance(idx, str):
+            if not isinstance(self._val, dict):
+                raise TypeError("Expected dict value")
+            return _YamlDefaultValue(self._val[idx])
+        else:
+            raise KeyError("Key should have either type 'str' or 'int'")
+
+    def __setitem__(self, idx: Union[int, str], val: Union[str, int, bool, float]):
+        if isinstance(idx, int):
+            if not isinstance(self._val, list):
+                raise TypeError("Expected list value")
+            self._val[idx] = val
+        elif isinstance(idx, str):
+            if not isinstance(self._val, dict):
+                raise TypeError("Expected dict value")
+            self._val[idx] = val
+        else:
+            raise KeyError("Key should have either type 'str' or 'int")
+
+    def _get(self, name: str) -> Optional["_YamlDefaultValue"]:
+        if not isinstance(self._val, dict):
+            raise TypeError("Expected dict value")
+        if name in self._val:
+            return _YamlDefaultValue(self._val[name])
+        return None
+
+    def get(self, name: str, default) -> "_YamlDefaultValue":
+        val = self._get(name)
+        if val:
+            return val
+        return _YamlDefaultValue(default)
+
+    def keys(self) -> List[str]:
+        """Get all keys for this mapping"""
+        if not isinstance(self._val, dict):
+            raise TypeError("Expected dict value")
+        return list(self._val.keys())
+
+    def items(self) -> List[Tuple[str, "_YamlDefaultValue"]]:
+        """Get all items for this mapping"""
+        if not isinstance(self._val, dict):
+            raise TypeError("Expected dict value")
+        return [(key, _YamlDefaultValue(val)) for key, val in self._val.items()]
 
 
 class YamlValue:  # pylint: disable=too-few-public-methods
@@ -132,12 +199,6 @@ class YamlValue:  # pylint: disable=too-few-public-methods
             raise YAMLProcessingError("Mapping node is expected", self.mark)
         return [(key.value, YamlValue(val)) for key, val in self._node.value]
 
-    def replace_value(self, val: Union[str, int, bool, float]):
-        "Set a new value for a scalar node"
-        if not isinstance(self._node, ScalarNode):
-            raise YAMLProcessingError("Can't replace value for a non-scalar node", self.mark)
-        self._node.value = val
-
     def __getitem__(self, idx: Union[str, int]) -> "YamlValue":
         if isinstance(idx, int):
             if not isinstance(self._node, SequenceNode):
@@ -150,28 +211,34 @@ class YamlValue:  # pylint: disable=too-few-public-methods
             return val
         raise KeyError("Key should have either type 'str' or 'int'")
 
+    def _represent_value(self, val: Union[str, int, bool, float]) -> Node:
+        representer = SafeRepresenter()
+        if isinstance(val, str):
+            return representer.represent_str(val)
+        if isinstance(val, int):
+            return representer.represent_int(val)
+        if isinstance(val, bool):
+            return representer.represent_bool(val)
+        if isinstance(val, float):
+            return representer.represent_float(val)
+        raise TypeError(f"Unsupported type {type(val)}")
+
     def __setitem__(self, idx: Union[str, int], val: Union[str, int, bool, float]):
+        # We need to make a copy of the node because yaml modules caches the nodes
+        # and will ignore the new value
         if isinstance(idx, int):
             if not isinstance(self._node, SequenceNode):
                 raise YAMLProcessingError("SequenceNode node is expected", self.mark)
-            self._node.value[idx].replace_value(val)
-        if isinstance(idx, str):
-            item = self._get(idx)
-            if item:
-                item.replace_value(val)
-            else:
-                representer = SafeRepresenter()
-                key_node = representer.represent_str(idx)
-                if isinstance(val, str):
-                    val_node = representer.represent_str(val)
-                elif isinstance(val, int):
-                    val_node = representer.represent_int(val)
-                elif isinstance(val, bool):
-                    val_node = representer.represent_bool(val)
-                else:
-                    val_node = representer.represent_float(val)
-                self._node.value.append((key_node, val_node))
-        raise KeyError("Key should have either type 'str' or 'int'")
+            self._node.value[idx] = self._represent_value(val)
+        elif isinstance(idx, str):
+            for k, v in self._node.value:
+                if k.value == idx:
+                    self._node.value.remove((k, v))
+            key_node = self._represent_value(idx)
+            val_node = self._represent_value(val)
+            self._node.value.append((key_node, val_node))
+        else:
+            raise KeyError("Key should have either type 'str' or 'int'")
 
     def __iter__(self) -> Iterator["YamlValue"]:
         for item in self._node.value:

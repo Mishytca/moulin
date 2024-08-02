@@ -100,9 +100,11 @@ def _handle_shared_opts(description: str,
             raise Exception(f"Config file requires version {conf.min_ver}," +
                             f" while you are running moulin {our_ver}")
 
-    prog = f"{sys.argv[0]} {local_conf_file}"
+    _, exec_name = os.path.split(sys.argv[0])
+    prog = f"{exec_name} {local_conf_file}"
     desc = f"Config file description: {conf.desc}"
-    config_argparser = argparse.ArgumentParser(description=desc, prog=prog, add_help=False)
+    config_argparser = argparse.ArgumentParser(description=desc, prog=prog, add_help=False,
+                                               formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     for parameter in conf.get_parameters().values():
         config_argparser.add_argument(f"--{parameter.name}",
                                       choices=[x.name for x in parameter.variants.values()],

@@ -249,6 +249,8 @@ repositories. There is a full list of supported parameters:
   url: "url://for.repository/project.git"
   rev: revision_name
   dir: "directory/where/store/code"
+  depth: 1
+  submodules: true
 
 
 
@@ -262,6 +264,11 @@ repositories. There is a full list of supported parameters:
   cloning. If this option is missed, `moulin` will try to guess
   directory name from :code:`url`. This path is relative to
   component's build directory.
+* :code:`submodules` - optional - boolean. Fetch submodules along with
+  main repository.
+* :code:`depth` - optional - cloning depth. Corresponds to :code:`--depth`
+  option for :code:`git clone`. If used together with :code:`submodules`
+  enabled, it will call :code:`git`  with :code:`--shallow-submodules`
 
 repo fetcher
 ^^^^^^^^^^^^
@@ -296,6 +303,30 @@ list of supported options:
   initialize `repo` repository right in component's build directory,
   as this is a main `repo` use case.
 
+
+http fetcher
+^^^^^^^^^^^^^^
+
+`http` fetcher is used to download a file via HTTP or HTTPS protocol. It uses
+:code:`curl` tool to do so. Full list of supported options:
+
+.. code-block:: yaml
+
+  type: http # Selects `http` fetcher
+  url: "https://example.com/file.txt"
+  filename: "file.txt"
+  dir: "."
+
+* :code:`type` - mandatory - should be :code:`http` to use `http`
+  fetcher. Use the same type even if you are downloading over HTTPS
+  protocol.
+* :code:`url` - mandatory - URL of a file do be downloaded
+* :code:`filename` - optional (in most cases) - name of the output
+  file. If omitted, `moulin` will try to guess it from a URL. But if
+  can't do so, it will ask you to provide filename manually.
+* :code:`dir` - optional - directory name where store a downloaded
+  file. If it is omitted, `moulin` will use :code:`"."` to download a
+  file right into the component's root directory.
 
 unpack fetcher
 ^^^^^^^^^^^^^^
@@ -355,6 +386,20 @@ https://docs.zephyrproject.org/latest/develop/west/built-in.html#west-init
 
 Regarding installation of `west`, please see:
 https://docs.zephyrproject.org/latest/develop/west/install.html
+
+null fetcher
+^^^^^^^^^^^^
+
+`null` fetcher does nothing. It can be used for testing or in some
+tricky situation when you want to have component without fetchers.
+
+.. code-block:: yaml
+
+  type: "null" # Selects `none` fetcher
+
+* :code:`type` - mandatory - should be :code:`"null"` to use `null` fetcher.
+  Please note that you need to use quotes, otherwise YAML parser will
+  treat it as `null` type.
 
 Builders
 --------
@@ -678,7 +723,10 @@ Optional parameters:
   kernel into :code:`additional_deps` of zephyr's config. This will
   ensure that zephyr will be built **after** DomU.
 
-* :code:`shields` - list of shields should be integrated to zephyr board.
+* :code:`shields` - list of shields should be integrated to zephyr board(For Zephyr < 3.4.0).
+
+* :code:`snippets` - list of snippets should be integrated to zephyr board(For Zephyr >= 3.4.0).
+  Please note that only one of :code:`shields` and :code:`snippets` can be used at the same time.
 
 * :code:`vars` - list of additional variables that should be passed to cmakw
   via :code:`west build`.
@@ -687,6 +735,8 @@ Please note that this builder uses :code:`--pristine=auto` command-line option.
 
 Proper versions of CMake and Zephyr SDK have to be installed on the host.
 
+For additional details please see
+https://docs.zephyrproject.org/latest/develop/west/build-flash-debug.html#building-west-build
 
 custom_script builder
 ^^^^^^^^^^^^^^^^^^^^^
@@ -702,6 +752,9 @@ script as parameter
     type: custom_script        # Should be 'custom_script'
     work_dir : "script_workdir"
     script: "path/to/script/custom_script.py"
+    args:
+      - "argument1"
+      - "argument2"
     config:
       items:
         "rootfs": "images/spider/rootfs.tar.bz2"
@@ -732,7 +785,8 @@ Mandatory options:
 
 Optional parameters:
 
-* :code:`args` - additional arguments should be passed to :code:`script`
+* :code:`args` - additional arguments should be passed to :code:`script`. Can be passed as
+  string or list
 
 * :code:`additional_deps` - list of additional dependencies. This is
   basically :code:`target_images` produced by other components. You
@@ -745,5 +799,22 @@ Optional parameters:
 * Remaining parameters should be parsed and used by script pointed in
   :code:`script` option.
 
-For additional details please see
-https://docs.zephyrproject.org/latest/develop/west/build-flash-debug.html#building-west-build
+
+null builder
+^^^^^^^^^^^^
+
+"null" builder does nothing at all. It even does not generate
+dependencies. It can be used for testing or in cases when you need to
+call fetcher only. Please note that Ninja will not call fetcher for
+the component if fetcher's output file is not used by anything.
+
+.. code-block:: yaml
+
+  builder:
+    type: "null"        # Should be "null"
+
+Mandatory options:
+
+* :code:`type` - Builder type. It should be :code:`"null"` for this type
+  of builder. Please note that you need to use quotes, otherwise YAML parser will
+  treat it as `null` type.

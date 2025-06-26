@@ -16,6 +16,8 @@ import yaml
 from urllib.parse import urlparse, unquote
 import urllib.request
 import os.path
+import re
+import psutil
 
 from packaging.version import Version
 
@@ -135,6 +137,9 @@ def moulin_entry():
         f'Moulin meta-build system v{Version(importlib_metadata.version("moulin"))}',
         additional_opts=additional_opts)
 
+    # Check version and notify
+    check_version_and_notify()
+
     if not args.fetcherdep:
         log.info("Generating build.ninja")
         build_generator.generate_build(conf, args.conf)
@@ -248,3 +253,55 @@ def _rouge_validate_output(output_file: str, args):
         log.warning("Overwriting file %s", output_file)
 
     return output_path
+
+
+def check_version_and_notify() -> None:
+    """
+    Add commentMore actions
+    Check local and remote versions of Moulin and notify user if update is available.
+    """
+    if is_invoked_by_ninja():
+        log.info("check version SKIPPED")
+        return
+
+    # Get local version
+    local_version = str(Version(importlib_metadata.version("moulin")))
+
+    # Get remote version
+    url = "https://raw.githubusercontent.com/Mishytca/moulin/main/setup.py"
+    remote_version = None
+
+    try:
+        with urllib.request.urlopen(url, timeout=0.5) as response:
+            content = response.read().decode("utf-8")
+        match = re.search(r'version\s*=\s*["\']([\d\.]+)["\']', content)
+        if match:
+            remote_version = match.group(1)
+    except Exception as e:
+        log.warning("Remote version check failed: %s", e)
+
+    if not remote_version:
+        log.warning("Using Moulin version: %s (remote check failed)", local_version)
+        return
+
+    # Compare versions and notify
+    if Version(local_version) < Version(remote_version):
+        log.warning("Moulin is outdated.")
+        log.warning("Local version : %s", local_version)
+        log.warning("Remote version: %s", remote_version)
+        log.warning("Please update Moulin")
+    else:
+        log.info("You are using the latest version of Moulin: %s", local_version)
+
+
+def is_invoked_by_ninja() -> bool:
+    try:
+        proc = psutil.Process()
+        while proc:
+            name = proc.name()
+            if 'ninja' in name:
+                return True
+            proc = proc.parent()
+    except Exception as e:
+        log.warning("Could not determine parent process: %s", e)
+        return False

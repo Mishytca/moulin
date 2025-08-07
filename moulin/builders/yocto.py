@@ -41,12 +41,51 @@ def gen_build_rules(generator: ninja_syntax.Writer):
                    restat=True)
     generator.newline()
 
-    # Add bitbake layers by calling bitbake-layers script
-    cmd = " && ".join([
-        "cd $yocto_dir",
-        "source poky/oe-init-build-env $work_dir",
-        "bitbake-layers add-layer $layers",
-        "touch $out",
+    # The command manages Yocto project layers during the build process.
+    # It checks the given set of layers against the ones previously used in the build.
+    # If a cache file exists, it compares the provided layers with the ones supplied by
+    # bitbake-layers show-layers.
+    # The "path" column is from bitbake-layers show-layers and converted into an array.
+    # Then the array is canonicalized to bring all paths to a single, standard format.
+    # After that, the paths are converted to relative paths.
+    # The provided layer set is also converted into an array.
+    # To speed things up, the logic first compares the number of elements in both arrays.
+    # If the count is the same, it compares the actual contents of the arrays.
+    # If any of these checks detect a difference, the existing layers are removed and replaced
+    # with the new set, and the hash is updated.
+    # If the cache file does not exist, the logic adds the layers to Yocto and saves the cache
+    # for future use.
+    cmd = " ".join([
+        r'cd $yocto_dir', r'&&',
+        r'source poky/oe-init-build-env $work_dir', r'&&',
+        r'if [ -e \"$out\" ];',
+        r'then echo \"======= The file out exists =========\"', r'&&',
+        r'readarray -t show_layers_arr < <(bitbake-layers show-layers | ',
+        r'tail -n +7 | tr -s \" \" | cut -d\" \" -f2)', r'&&',
+        r'for i in \"\$${!show_layers_arr[@]}\";',
+        r'do show_layers_arr[\$$i]=\$$(readlink -f \"\$${show_layers_arr[\$$i]}\");',
+        r'done', r'&&',
+        r'show_layers_arr_adapt=(\"\$${show_layers_arr[@]}\")', r'&&',
+        r'for i in \"\$${!show_layers_arr_adapt[@]}\";',
+        r'do show_layers_arr_adapt[\$$i]=\$$(realpath --relative-to=\"\$$PWD\" ',
+        r'\"\$${show_layers_arr_adapt[\$$i]}\");',
+        r'done', r'&&',
+        r'show_layers_str=\"\$${show_layers_arr_adapt[@]}\"', r'&&',
+        r'readarray -t current_layers_arr <<< \"\$$(echo \"$layers\" |  xargs -n1)\"', r'&&',
+        r'if [ \"\$${#show_layers_arr_adapt[*]}\" -ne \"\$${#current_layers_arr[*]}\" ];',
+        r'then (bitbake-layers remove-layer \$$show_layers_str) || true;',
+        r'bitbake-layers add-layer $layers', r'&&',
+        r'touch \"$out\";'
+        r'elif [ \"\$${show_layers_arr_adapt[*]}\" != \"\$${current_layers[*]}\" ];',
+        r'then (bitbake-layers remove-layer \$$show_layers_str) || true;',
+        r'bitbake-layers add-layer $layers', r'&&',
+        r'touch \"$out\";'
+        r'else bitbake-layers add-layer $layers;',
+        r'fi;',
+        r'else echo \"======= The file out does not exist =========\"', r'&&',
+        r'bitbake-layers add-layer $layers', r'&&',
+        r'touch \"$out\";'
+        r'fi;',
     ])
     generator.rule("yocto_add_layers",
                    command=f'bash -c "{cmd}"',

@@ -12,6 +12,7 @@ from moulin import ninja_syntax
 from moulin.yaml_wrapper import YamlValue
 from moulin.yaml_helpers import YAMLProcessingError
 import logging
+import sys
 
 
 YOCTO_CORE_LAYERS = ["../poky/meta", "../poky/meta-poky", "../poky/meta-yocto-bsp"]
@@ -41,16 +42,22 @@ def gen_build_rules(generator: ninja_syntax.Writer):
                    restat=True)
     generator.newline()
 
-    # Add bitbake layers by calling bitbake-layers script
+    # Build a stable CLI that reuses the current Moulin invocation (script + args).
+    # This guarantees the utility gets the same build.yaml and global flags.
+    base_cli = shlex.join([os.path.basename(sys.argv[0]), *sys.argv[1:]])
+
+    # Add and remote bitbake layers use --utility-builders-yocto_set_layers
     cmd = " && ".join([
-        "cd $yocto_dir",
-        "source poky/oe-init-build-env $work_dir",
-        "bitbake-layers add-layer $layers",
-        "touch $out",
+        f'{base_cli} '
+        '--utility-builders-yocto_set_layers '
+        '--yocto-dir "$yocto_dir" '
+        '--work-dir "$work_dir" '
+        '--set-layers $layers',
+        'touch "$out"',
     ])
     generator.rule("yocto_add_layers",
                    command=f'bash -c "{cmd}"',
-                   description="Add yocto layers",
+                   description="Add and remote yocto layers",
                    pool="console",
                    restat=True)
     generator.newline()

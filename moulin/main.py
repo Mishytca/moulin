@@ -11,6 +11,7 @@ from time import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Dict, List, Tuple, Any
+import importlib
 import importlib_metadata
 import yaml
 from urllib.parse import urlparse, unquote
@@ -29,6 +30,45 @@ from moulin.log_utils import build_handlers
 log = logging.getLogger(__name__)
 
 OptionDef = Tuple[List[str], Dict[str, Any]]
+
+# Marker prefix for utility calls
+UTILITY_PREFIX = "--utility-"
+
+
+def _extract_utility(argv: List[str]):
+    """
+    Look for the first argument that starts with the utility prefix ("--utility-").
+    Returns a tuple: (utility_name, rest_argv, index_of_marker) or (None, None, None)
+    - utility_name: string without the prefix (e.g., "builder-yocto")
+    - rest_argv: list of arguments after the marker (to be parsed by the utility itself)
+    - index_of_marker: position in argv where the marker was found
+    """
+    print("argv (list) =", argv)
+    for i, tok in enumerate(argv[1:], start=1):      # skip argv[0] (script name)
+        if tok.startswith(UTILITY_PREFIX):
+            util_name = tok[len(UTILITY_PREFIX):]    # remove prefix, keep only name
+            rest = argv[i+1:]                        # all args after the marker
+            return util_name, rest, i
+    return None, None, None
+
+
+def _dispatch_utility(mod_qual: str, argv: List[str], conf):
+    """
+    Import moulin.<mod_qual>, find handle_utility_call() or main(), and run it.
+    """
+    try:
+        mod = importlib.import_module(f"moulin.{mod_qual}")
+    except ModuleNotFoundError as e:
+        log.error("Utility module 'moulin.%s' not found: %s", mod_qual, e)
+        sys.exit(2)
+
+    # Prefer handle_utility_call(conf, argv), fallback to main(conf, argv)
+    handler = getattr(mod, "handle_utility_call", None) or getattr(mod, "main", None)
+    if not handler:
+        log.error("Utility 'moulin.%s' has no handle_utility_call() or main()", mod_qual)
+        sys.exit(2)
+
+    return handler(conf, argv)
 
 
 def _prepre_shared_opts(description: str,
@@ -128,7 +168,15 @@ def _handle_shared_opts(description: str,
 
 def moulin_entry():
     """Console entry point for moulin"""
+    # Step 1: Detect if this run is calling a utility
+    util_name, util_argv, util_idx = _extract_utility(sys.argv)
 
+    # Step 2: If utility detected → remove marker and all args after it from sys.argv
+    # so the main parser won't see unknown arguments
+    if util_name is not None:
+        sys.argv = sys.argv[:util_idx]
+
+    # Step 3: Parse shared options and load YAML configuration
     additional_opts = [
         (["--fetcherdep"], dict(nargs=1, metavar="component", help=argparse.SUPPRESS)),
     ]
@@ -136,6 +184,13 @@ def moulin_entry():
         f'Moulin meta-build system v{Version(importlib_metadata.version("moulin"))}',
         additional_opts=additional_opts)
 
+    # Step 4: If utility was called → route to its module
+    if util_name is not None:
+        # Map "builder-yocto" → "builder.yocto"
+        mod_qual = util_name.replace("-", ".")
+        return _dispatch_utility(mod_qual, util_argv or [], conf)
+
+    # Step 5: Normal Moulin behavior (unchanged)
     if not args.fetcherdep:
         # Check version and notify
         check_version_and_notify()

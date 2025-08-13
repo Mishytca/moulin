@@ -12,6 +12,11 @@ from moulin import ninja_syntax
 from moulin.yaml_wrapper import YamlValue
 from moulin.yaml_helpers import YAMLProcessingError
 import logging
+import sys
+import subprocess
+import argparse
+import argparse, os, shlex, subprocess, sys
+from typing import List
 
 
 YOCTO_CORE_LAYERS = ["../poky/meta", "../poky/meta-poky", "../poky/meta-yocto-bsp"]
@@ -41,12 +46,16 @@ def gen_build_rules(generator: ninja_syntax.Writer):
                    restat=True)
     generator.newline()
 
+    # Build a stable CLI that reuses the current Moulin invocation (script + args).
+    # This guarantees the utility gets the same build.yaml and global flags.
+    base_cli = shlex.join([sys.argv[0], *sys.argv[1:]])
+
     # Add bitbake layers by calling bitbake-layers script
     cmd = " && ".join([
-        "cd $yocto_dir",
-        "source poky/oe-init-build-env $work_dir",
-        "bitbake-layers add-layer $layers",
-        "touch $out",
+        f'{base_cli} --utility-builders-yocto '
+        f'--yocto-dir "$yocto_dir" --work-dir "$work_dir" '
+        f'--set-layers $layers',
+        "touch $out",  # mark the target as updated for Ninja
     ])
     generator.rule("yocto_add_layers",
                    command=f'bash -c "{cmd}"',
@@ -287,3 +296,39 @@ class YoctoBuilder:
         Update stored local conf with actual SRCREVs for VCS-based recipes.
         This should ensure that we can reproduce this exact build later
         """
+
+
+def handle_utility_call(conf, argv):
+    """
+    Minimal utility: cd into Yocto dir, source env, then add layers.
+    No extra checks, no printing.
+    """
+    parser = argparse.ArgumentParser(prog="--utility-builders-yocto", add_help=False)
+    parser.add_argument("--yocto-dir", required=True)
+    parser.add_argument("--work-dir", required=True)
+    parser.add_argument("--set-layers", nargs="+", required=True)
+    args = parser.parse_args(argv)
+
+    # Quote layer paths to avoid word splitting
+    layers = " ".join(shlex.quote(x) for x in args.set_layers)
+
+    # Exactly the three commands you asked for
+    shell_snippet = " && ".join([
+        'cd "$YOCTO"',
+        'source poky/oe-init-build-env "$WORK"',
+        f'bitbake-layers add-layer {layers}',
+    ])
+
+    # Run via bash -lc so that `source` works as expected
+    cmd = (
+        f'YOCTO={shlex.quote(args.yocto_dir)} '
+        f'WORK={shlex.quote(args.work_dir)} '
+        f'bash -lc {shlex.quote(shell_snippet)}'
+    )
+
+    try:
+        subprocess.run(cmd, shell=True, check=True)
+        return 0
+    except subprocess.CalledProcessError as e:
+        # No extra handling; just propagate non-zero code back to Ninja
+        return e.returncode

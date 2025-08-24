@@ -12,6 +12,12 @@ from moulin import ninja_syntax
 from moulin.yaml_wrapper import YamlValue
 from moulin.yaml_helpers import YAMLProcessingError
 import logging
+import sys
+import subprocess
+import argparse
+import os
+import re
+from pathlib import Path
 
 
 YOCTO_CORE_LAYERS = ["../poky/meta", "../poky/meta-poky", "../poky/meta-yocto-bsp", "../openembedded-core/meta"]
@@ -41,16 +47,21 @@ def gen_build_rules(generator: ninja_syntax.Writer):
                    restat=True)
     generator.newline()
 
-    # Add bitbake layers by calling bitbake-layers script
-    cmd = " && ".join([
-        "cd $yocto_dir",
-        "source $distro_dir/oe-init-build-env $work_dir",
-        "bitbake-layers add-layer $layers",
-        "touch $out",
-    ])
-    generator.rule("yocto_add_layers",
+    # Minimal CLI: program + --utility-builders-yocto + all args.
+    prog = os.path.basename(sys.argv[0])
+
+    # Use --utility-builders-yocto to add and remove BitBake layers
+    cmd = (
+        f"{prog} "
+        "--utility-builders-yocto "
+        "--yocto-dir $yocto_dir "
+        "--work-dir $work_dir "
+        "--layers $layers "
+        "--stamp $out"
+    )
+    generator.rule("yocto_update_layers",
                    command=f'bash -c "{cmd}"',
-                   description="Add yocto layers",
+                   description="Synchronize Yocto layers with a moulin configuration file",
                    pool="console",
                    restat=True)
     generator.newline()
@@ -242,7 +253,7 @@ class YoctoBuilder:
             layers_stamp = create_stamp_name(self.yocto_dir, self.work_dir, "yocto", "layers")
             layers = " ".join(_filter_yocto_core_layers(_flatten_layers(layers_node)))
             self.generator.build(layers_stamp,
-                                 "yocto_add_layers",
+                                 "yocto_update_layers",
                                  env_target,
                                  variables=dict(common_variables, layers=layers))
 
@@ -294,3 +305,186 @@ class YoctoBuilder:
         Update stored local conf with actual SRCREVs for VCS-based recipes.
         This should ensure that we can reproduce this exact build later
         """
+
+
+def _env_prefix(yocto_dir: str, work_dir: str) -> str:
+    """
+    Return a shell snippet that cd's into yocto_dir and sources
+    oe-init-build-env for work_dir.
+    """
+    return " && ".join([
+        f"cd {shlex.quote(yocto_dir)}",
+        f". poky/oe-init-build-env {shlex.quote(work_dir)}",
+    ])
+
+
+def _run_bash(cmd: str, *, capture=False) -> subprocess.CompletedProcess:
+    """Run a bash -lc command."""
+    return subprocess.run(
+        ["bash", "-lc", cmd],
+        check=True,
+        capture_output=capture,
+        text=capture,
+    )
+
+
+def relative_paths_to_absolute(base: Path, rels: List[str]) -> List[str]:
+    return [str((base / rel).resolve(strict=False)) for rel in rels]
+
+
+def _read_managed_layers(stamp: str) -> List[str]:
+    path = Path(stamp)
+    if not path.exists():
+        return []
+    return [
+        line.strip()
+        for line in path.read_text().splitlines()
+        if line.strip()
+    ]
+
+
+def _write_managed_layers(stamp: str, layers: List[str]) -> None:
+    Path(stamp).write_text("\n".join(layers) + "\n")
+
+
+def handle_utility_call(argv: List[str]) -> int:
+    """
+    Synchronize Yocto build layers with the specification from YAML.
+
+    Moulin manages only layers explicitly defined in YAML or previously
+    recorded in the stamp/state file. Layers added externally are ignored.
+
+    Workflow:
+
+      1. If the stamp/state file does not exist:
+        - Add all specified YAML layers to the build environment.
+        - Store the list of managed layers in the stamp/state file.
+
+      2. If the stamp/state file exists:
+        - Run 'bitbake-layers show-layers' to read all active layers.
+        - Normalize layer paths.
+        - Consider only Moulin-managed layers.
+        - Remove layers that were previously managed but disappeared from YAML.
+        - Add YAML layers missing from the current build.
+        - Recreate managed layers if needed to preserve YAML order.
+        - Update the stamp/state file.
+    """
+
+    # Parse args
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--yocto-dir", required=True)  # path to Yocto root
+    parser.add_argument("--work-dir", required=True)  # path to build dir
+    parser.add_argument("--layers", nargs="+", required=True)  # YAML layers (relative to yocto root)
+    parser.add_argument("--stamp", required=True)  # stamp file path
+    args = parser.parse_args(argv)
+    quoted_layers = " ".join(shlex.quote(layer) for layer in args.layers)
+
+    # Extract args into local variables
+    yaml_layers_str = quoted_layers
+    yocto_root = args.yocto_dir
+    build_dir = args.work_dir
+    stamp_out = args.stamp
+    stamp_exists = Path(stamp_out).exists()
+    env_prefix = _env_prefix(yocto_root, build_dir)
+
+    # Compute absolute build path
+    build_dir_path = Path(build_dir)
+    build_dir_abs: Path = (
+        build_dir_path if build_dir_path.is_absolute()
+        else (Path(yocto_root) / build_dir_path)).resolve(strict=False)
+
+    # Get absolute paths for YAML-specified layers
+    yaml_layers_abs: List[str] = relative_paths_to_absolute(build_dir_abs, args.layers)
+
+    # CASE 1: No stamp/state file yet -> add YAML layers and record them as managed by Moulin
+    if not stamp_exists:
+        _run_bash(" && ".join([
+            f"{env_prefix}",
+            f"bitbake-layers add-layer {yaml_layers_str}",
+        ]))
+        _write_managed_layers(stamp_out, yaml_layers_abs)
+        return 0
+
+    # CASE 2: State file exists -> sync only Moulin-managed layers
+    # Run "bitbake-layers show-layers" to list currently active layers
+    # Example command output:
+    #     layer                 path                             priority
+    # ==========================================================================
+    # meta                  /home/../../project/yocto/poky/meta  5
+    # meta-poky             /home/../../project/yocto/poky/meta-poky  5
+    # meta-yocto-bsp        /home/../../project/yocto/poky/meta-yocto-bsp  5
+    # meta-virtualization   /home/../../project/yocto/meta-virtualization  8
+    # meta-oe               /home/../../project/yocto/meta-openembedded/meta-oe  5
+    # meta-filesystems      /home/../../project/yocto/meta-openembedded/meta-filesystems  5
+    # meta-python           /home/../../project/yocto/meta-openembedded/meta-python  5
+    # meta-networking       /home/../../project/yocto/meta-openembedded/meta-networking  5
+    # ...and so on
+    layers_output = _run_bash(f"{env_prefix} && bitbake-layers show-layers", capture=True).stdout
+
+    # Extract the 'path' column with regex
+    row_re = re.compile(r"^[ \t]*#?[ \t]*\S+[ \t]+(?P<path>.+?)[ \t]+(?:\d+)[ \t]*$", re.MULTILINE)
+    layers_paths: List[str] = row_re.findall(layers_output)
+
+    # Canonicalize build layer paths
+    canonical_layer_paths = [str(Path(p).expanduser().resolve(strict=False)) for p in layers_paths]
+
+    # Create sets for efficient lookup during synchronization
+    current_layer_paths_set = set(canonical_layer_paths)
+    yaml_layers_abs_set = set(yaml_layers_abs)
+    previous_managed_layers_abs = _read_managed_layers(stamp_out)
+    previous_managed_layers_abs_set = set(previous_managed_layers_abs)
+
+    # Consider only layers that are managed by Moulin.
+    # External layers reported by bitbake-layers are ignored.
+    # Preserve the current relative order of managed layers.
+    current_managed_layers_abs = [
+        p for p in canonical_layer_paths
+        if p in previous_managed_layers_abs_set or p in yaml_layers_abs_set
+    ]
+
+    # Remove only layers that Moulin managed before and that disappeared from YAML.
+    to_remove_abs = [
+        p for p in previous_managed_layers_abs
+        if p not in yaml_layers_abs_set and p in current_layer_paths_set
+    ]
+
+    # Add YAML layers that are missing from the current build.
+    to_add_abs = [
+        p for p in yaml_layers_abs
+        if p not in current_layer_paths_set
+    ]
+
+    # Check whether simple remove + append-add preserves YAML order.
+    expected_after_diff = [
+        p for p in current_managed_layers_abs
+        if p in yaml_layers_abs_set
+    ] + to_add_abs
+
+    need_recreate = expected_after_diff != yaml_layers_abs
+
+    if need_recreate:
+        # Recreate only Moulin-managed layers in the YAML order.
+        to_remove_abs = [
+            p for p in current_managed_layers_abs
+            if p in current_layer_paths_set
+        ]
+        to_add_abs = yaml_layers_abs
+
+    remove_cmd = (
+        "bitbake-layers remove-layer " +
+        " ".join(shlex.quote(p) for p in to_remove_abs)
+        if to_remove_abs else ""
+    )
+
+    add_cmd = (
+        "bitbake-layers add-layer " +
+        " ".join(shlex.quote(p) for p in to_add_abs)
+        if to_add_abs else ""
+    )
+
+    cmd_parts = [env_prefix, remove_cmd, add_cmd]
+    cmd = " && ".join(part for part in cmd_parts if part)
+
+    _run_bash(cmd)
+    _write_managed_layers(stamp_out, yaml_layers_abs)
+    return 0

@@ -12,6 +12,12 @@ from moulin import ninja_syntax
 from moulin.yaml_wrapper import YamlValue
 from moulin.yaml_helpers import YAMLProcessingError
 import logging
+import sys
+import subprocess
+import argparse
+import os
+import re
+from pathlib import Path
 
 
 YOCTO_CORE_LAYERS = ["../poky/meta", "../poky/meta-poky", "../poky/meta-yocto-bsp", "../openembedded-core/meta"]
@@ -28,7 +34,7 @@ def get_builder(conf: YamlValue, name: str, build_dir: str, src_stamps: List[str
 
 def gen_build_rules(generator: ninja_syntax.Writer):
     """
-    Generate yocto build rules for ninja
+    Generate Yocto build rules for Ninja
     """
     # Create build dir by calling poky/oe-init-build-env script
     cmd = " && ".join([
@@ -41,16 +47,21 @@ def gen_build_rules(generator: ninja_syntax.Writer):
                    restat=True)
     generator.newline()
 
-    # Add bitbake layers by calling bitbake-layers script
-    cmd = " && ".join([
-        "cd $yocto_dir",
-        "source $distro_dir/oe-init-build-env $work_dir",
-        "bitbake-layers add-layer $layers",
-        "touch $out",
-    ])
-    generator.rule("yocto_add_layers",
+    # Minimal CLI: program + --utility-builders-yocto + all args.
+    prog = os.path.basename(sys.argv[0])
+
+    # Use --utility-builders-yocto to add and remove BitBake layers
+    cmd = (
+        f"{prog} "
+        "--utility-builders-yocto "
+        "--yocto-dir $yocto_dir "
+        "--work-dir $work_dir "
+        "--layers $layers "
+        "--stamp $out"
+    )
+    generator.rule("yocto_update_layers",
                    command=f'bash -c "{cmd}"',
-                   description="Add yocto layers",
+                   description="Synchronize Yocto layers with a moulin configuration file",
                    pool="console",
                    restat=True)
     generator.newline()
@@ -186,10 +197,10 @@ class YoctoBuilder:
         self.name = name
         self.generator = generator
         self.src_stamps = src_stamps
-        # With yocto builder it is possible to have multiple builds with the same set of
+        # With Yocto builder, it is possible to have multiple builds with the same set of
         # layers. Thus, we have two variables - build_dir and work_dir
         # - yocto_dir is the upper directory where layers are stored. Basically, we should
-        #   have core layers  in our yocto_dir
+        #   have core layers in our yocto_dir
         # - work_dir is the build directory where we can find conf/local.conf, tmp and other
         #   directories. It is called "build" by default
         self.yocto_dir = build_dir
@@ -213,7 +224,7 @@ class YoctoBuilder:
         return ret
 
     def gen_build(self):
-        """Generate ninja rules to build yocto/poky"""
+        """Generate Ninja rules to build Yocto/Poky"""
         common_variables = {
             "yocto_dir": self.yocto_dir,
             "work_dir": self.work_dir,
@@ -242,7 +253,7 @@ class YoctoBuilder:
             layers_stamp = create_stamp_name(self.yocto_dir, self.work_dir, "yocto", "layers")
             layers = " ".join(_filter_yocto_core_layers(_flatten_layers(layers_node)))
             self.generator.build(layers_stamp,
-                                 "yocto_add_layers",
+                                 "yocto_update_layers",
                                  env_target,
                                  variables=dict(common_variables, layers=layers))
 
@@ -294,3 +305,168 @@ class YoctoBuilder:
         Update stored local conf with actual SRCREVs for VCS-based recipes.
         This should ensure that we can reproduce this exact build later
         """
+
+
+def _env_prefix(yocto_dir: str, work_dir: str) -> str:
+    """
+    Return a shell snippet that cd's into yocto_dir and sources
+    oe-init-build-env for work_dir.
+    """
+    return " && ".join([
+        f"cd {shlex.quote(yocto_dir)}",
+        f". poky/oe-init-build-env {shlex.quote(work_dir)}",
+    ])
+
+
+def _run_bash(cmd: str, *, capture=False) -> subprocess.CompletedProcess:
+    """Run a bash -lc command."""
+    return subprocess.run(
+        ["bash", "-lc", cmd],
+        check=True,
+        capture_output=capture,
+        text=capture,
+    )
+
+
+def relative_paths_to_absolute(base: Path, rels: List[str]) -> List[str]:
+    return [str((base / rel).resolve(strict=False)) for rel in rels]
+
+
+def handle_utility_call(argv: List[str]) -> int:
+    """
+    Synchronize Yocto build layers with the specification from YAML.
+    The function ensures that the active Yocto layers in a build directory
+    match the layers defined in the YAML configuration. It uses a "stamp"
+    file to detect if synchronization has already been performed.
+
+    Workflow:
+
+      1. If the stamp file does not exist:
+        - Add all specified YAML layers to the build environment.
+        - Create the stamp file.
+
+      2. If the stamp file exists:
+        - Run 'bitbake-layers show-layers' to read the currently active layers.
+        - Normalize their paths and exclude Yocto core layers.
+        - Compare the current layer list with the YAML configuration.
+        - If the order differs, recreate the managed layers in the YAML order.
+        - Otherwise, synchronize only missing and extra layers.
+    """
+
+    # Parse args
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--yocto-dir", required=True)  # path to Yocto root
+    parser.add_argument("--work-dir", required=True)  # path to build dir
+    parser.add_argument("--layers", nargs="+", required=True)  # YAML layers (relative to yocto root)
+    parser.add_argument("--stamp", required=True)  # stamp file path
+    args = parser.parse_args(argv)
+    quoted_layers = " ".join(shlex.quote(layer) for layer in args.layers)
+    quoted_stamp = shlex.quote(args.stamp)
+
+    # Extract args into local variables
+    yaml_layers_str = quoted_layers
+    yocto_root = args.yocto_dir
+    build_dir = args.work_dir
+    stamp_out = args.stamp
+    stamp_exists = Path(stamp_out).exists()
+    env_prefix = _env_prefix(yocto_root, build_dir)
+
+    # Compute absolute build path
+    build_dir_path = Path(build_dir)
+    build_dir_abs: Path = (
+        build_dir_path if build_dir_path.is_absolute()
+        else (Path(yocto_root) / build_dir_path)).resolve(strict=False)
+
+    # CASE 1: No stamp file yet -> add layers and create stamp
+    if not stamp_exists:
+        _run_bash(" && ".join([
+            f"{env_prefix}",
+            f"bitbake-layers add-layer {yaml_layers_str}",
+            f"touch {quoted_stamp}",
+        ]))
+        return 0
+
+    # CASE 2: Stamp exists -> check current state and sync if needed
+    # Run "bitbake-layers show-layers" to list currently active layers
+    # Example command output:
+    #     layer                 path                             priority
+    # ==========================================================================
+    # meta                  /home/../../project/yocto/poky/meta  5
+    # meta-poky             /home/../../project/yocto/poky/meta-poky  5
+    # meta-yocto-bsp        /home/../../project/yocto/poky/meta-yocto-bsp  5
+    # meta-virtualization   /home/../../project/yocto/meta-virtualization  8
+    # meta-oe               /home/../../project/yocto/meta-openembedded/meta-oe  5
+    # meta-filesystems      /home/../../project/yocto/meta-openembedded/meta-filesystems  5
+    # meta-python           /home/../../project/yocto/meta-openembedded/meta-python  5
+    # meta-networking       /home/../../project/yocto/meta-openembedded/meta-networking  5
+    # ...and so on
+    show_output = _run_bash(f"{env_prefix} && bitbake-layers show-layers", capture=True).stdout
+
+    # Extract the 'path' column with regex
+    row_re = re.compile(r"^[ \t]*#?[ \t]*\S+[ \t]+(?P<path>.+?)[ \t]+(?:\d+)[ \t]*$", re.MULTILINE)
+    show_output_paths_only: List[str] = row_re.findall(show_output)
+
+    # Canonicalize build layer paths
+    canonical_show_path = [str(Path(p).expanduser().resolve(strict=False)) for p in show_output_paths_only]
+
+    # Get absolute paths for Yocto core layers
+    yocto_core_layers_abs: List[str] = relative_paths_to_absolute(build_dir_abs, YOCTO_CORE_LAYERS)
+
+    # Get absolute paths for YAML-specified layers
+    yaml_layers_abs: List[str] = relative_paths_to_absolute(build_dir_abs, args.layers)
+
+    # Convert lists to sets for fast membership checks
+    yocto_core_layers_abs_set = set(yocto_core_layers_abs)
+    yaml_layers_abs_set = set(yaml_layers_abs)
+
+    # Keep only layers managed by Moulin, preserving the current order
+    used_build_layers_abs = [
+        p for p in canonical_show_path
+        if p not in yocto_core_layers_abs_set
+    ]
+
+    # Create sets for efficient lookup during synchronization
+    used_build_layers_abs_set = set(used_build_layers_abs)
+
+    # Compute missing and obsolete layers
+    to_remove_abs = [
+        p for p in used_build_layers_abs
+        if p not in yaml_layers_abs_set
+    ]
+
+    to_add_abs = [
+        p for p in yaml_layers_abs
+        if p not in used_build_layers_abs_set
+    ]
+
+    # Check whether simple remove + append-add preserves YAML order
+    expected_after_diff = [
+        p for p in used_build_layers_abs
+        if p in yaml_layers_abs_set
+    ] + to_add_abs
+
+    need_recreate = expected_after_diff != yaml_layers_abs
+
+    if need_recreate:
+        # Recreate managed layers in the YAML order
+        to_remove_abs = used_build_layers_abs
+        to_add_abs = yaml_layers_abs
+
+    remove_cmd = (
+        "bitbake-layers remove-layer " +
+        " ".join(shlex.quote(p) for p in to_remove_abs)
+        if to_remove_abs else ""
+    )
+
+    add_cmd = (
+        "bitbake-layers add-layer " + " ".join(shlex.quote(p) for p in to_add_abs)
+        if to_add_abs else ""
+    )
+
+    touch_cmd = f"touch {quoted_stamp}"
+
+    cmd_parts = [env_prefix, remove_cmd, add_cmd, touch_cmd]
+    cmd = " && ".join(part for part in cmd_parts if part)
+
+    _run_bash(cmd)
+    return 0

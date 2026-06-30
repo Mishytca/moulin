@@ -371,6 +371,9 @@ Complete list of supported options:
   url: https://manifest.address/zephyr
   rev: manifest-revision
   file: manifest-file.yml
+  git_options:
+    - "--depth=1"
+  group_filter: "-group1,+group2"
 
 * :code:`type` - mandatory - should be :code:`west` to enable `west` fetcher.
 * :code:`url` - optional - manifest repository URL. You can provide
@@ -380,6 +383,26 @@ Complete list of supported options:
   :code:`--mr` option.
 * :code:`file` - optional - manifest file name. Corresponds to `west init`'s
   :code:`--mf` option.
+* :code:`git_options` - optional - list of additional git clone options for
+  the manifest repository. Each list item is passed to :code:`west init` as
+  a separate :code:`-o` option. For example, :code:`"--depth=1"` produces
+  :code:`west init ... -o=--depth=1`.
+* :code:`group_filter` - optional - west group filter expression or list of
+  expressions. Items are joined with commas and stored as
+  :code:`manifest.group-filter` in the west workspace before
+  :code:`west update` is executed. For example, :code:`"-group1,+group2"`
+  produces :code:`manifest.group-filter=-group1,+group2`. Both scalar string
+  and YAML list forms are supported:
+
+  .. code-block:: yaml
+
+    group_filter: "-group1,+group2"
+
+  .. code-block:: yaml
+
+    group_filter:
+      - "-group1"
+      - "+group2"
 
 For additional details, see documentation on `west init`:
 https://docs.zephyrproject.org/latest/develop/west/built-in.html#west-init
@@ -427,6 +450,7 @@ additional layers and :code:`bitbake` used to perform the build.
 
   builder:
     type: yocto       # Should be `yocto`
+    base_distro: poky # Optional
     work_dir: "build" # Optional
     build_target: core-image-minimal # Mandatory
     conf:             # Mandatory
@@ -459,6 +483,12 @@ Mandatory options:
 
 Optional parameters. Those provide advanced features that may be
 needed if you are building multiple VMs with cross-dependencies.
+
+* :code:`base_distro` - provides name of base distro
+  directory. Default value is :code:`poky` for compatibility reasons.
+  For newer Yocto releases you want to use :code:`openembedded-core`.
+  Currently this only affects location of :code:`oe-init-build-env`
+  script.
 
 * :code:`conf` - list of additional :code:`local.conf` options. Please
   note that each entry in :code:`conf` list is not a :code:`key:value`

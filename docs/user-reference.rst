@@ -60,7 +60,16 @@ and it is even hidden from :code:`-h` output. It is used by `moulin` to
 generate dynamic dependency files for Ninja, so Ninja can track changes
 inside components.
 
-This option is not meant to be used by a user.
+There is also a family of internal :code:`--utility-*` command-line
+options. These options are hidden from the :code:`-h` output and are
+used internally by `moulin` to invoke builder-specific utility
+handlers.
+
+For example, :code:`--utility-builders-yocto` is used by the Yocto
+builder to synchronize the active BitBake layer configuration with
+the layer list defined in the Moulin YAML manifest.
+
+These options are not meant to be used by a user.
 
 YAML sections
 -------------
